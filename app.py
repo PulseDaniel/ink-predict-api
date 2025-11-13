@@ -4,7 +4,7 @@ import os
 import json
 import sqlite3
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 import numpy as np
 import pandas as pd
@@ -34,7 +34,7 @@ bundle = joblib.load(MODEL_PATH)
 reg = bundle["model"]
 selector = bundle["selector"]
 scaler = bundle["scaler"]
-base_cols = bundle["base_cols"]
+base_cols: List[str] = bundle["base_cols"]
 tint_map = bundle["tint_map"]
 config = bundle.get("config", {})
 
@@ -52,7 +52,6 @@ except Exception:
     lib_df = None
 
 # ---------- HARD GROUP MAP (built-in) ----------
-# Short names → DC21 ink names in your model
 ALIASES = {
     "Rubine": "DC21-102 Rubine",
     "Bright Red": "DC21-101 Bright Red",
@@ -64,7 +63,6 @@ ALIASES = {
     "Green": "DC21-402 Green",
     "Violet": "DC21-604 Violet",
     "Black": "DC21-802 Black",
-    # if/when you have a real warm red base, change this:
     "Warm Red": "DC21-101 Bright Red",
 }
 
@@ -78,7 +76,6 @@ _GROUPS_SHORT = {
     "Greys":             ["Pro Blue", "Yellow", "Rubine", "Black"],
 }
 
-
 def to_dc_names(short_list):
     out = []
     for s in short_list:
@@ -87,10 +84,8 @@ def to_dc_names(short_list):
             out.append(name)
     return sorted(set(out))
 
-
 GROUPS = {g: to_dc_names(names) for g, names in _GROUPS_SHORT.items()}
 ALL_GROUP_NAMES = sorted(GROUPS.keys())
-
 
 def allowed_inks_for_group(group: Optional[str]) -> set:
     """
@@ -117,7 +112,6 @@ def allowed_inks_for_group(group: Optional[str]) -> set:
 
     return allowed
 
-
 # ---------- DB ----------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -137,19 +131,18 @@ def get_db():
     )
     return conn
 
-
 # ---------- API ----------
 app = FastAPI(title="Ink Formula Predictor API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later if you like
+    allow_origins=["*"],  # tighten later if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
+# ----- Schemas -----
 class PredictIn(BaseModel):
     L: float
     a: float
@@ -157,13 +150,11 @@ class PredictIn(BaseModel):
     lock_neighbours: bool = True
     group: Optional[str] = Field(None, description="One of /groups; restrict inks to this group (+Extender)")
 
-
 class PredictOut(BaseModel):
     input: Dict[str, float]
     formula: Dict[str, float]
     group: Optional[str] = None
     allowed_inks: Optional[list] = None
-
 
 class LogIn(BaseModel):
     pantone: Optional[str] = None
@@ -177,23 +168,40 @@ class LogIn(BaseModel):
     measured_b: Optional[float] = None
     notes: Optional[str] = None
 
+# NEW: shape used by your web UI
+class CorrectionIn(BaseModel):
+    target: Dict[str, float]                   # {L:.., a:.., b:..}
+    group: Optional[str] = None
+    original: Dict[str, float]                 # model suggestion
+    corrected: Dict[str, float]                # user-edited approval
+    context_name: Optional[str] = None         # PMS/label if any
+    note: Optional[str] = None
+    measured: Optional[Dict[str, float]] = None  # optional {L,a,b} if you feed measurements
 
+# ----- utils -----
+def _to_float_dict(d: Dict[str, float]) -> Dict[str, float]:
+    out = {}
+    for k, v in (d or {}).items():
+        try:
+            out[str(k)] = float(v)
+        except Exception:
+            continue
+    return out
+
+# ----- Routes -----
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 @app.get("/groups")
 def groups():
     """List available groups + their DC inks."""
     return {"groups": ALL_GROUP_NAMES, "group_inks": GROUPS}
 
-
 @app.get("/inks")
 def inks():
     """All base inks the model knows (for dropdowns)."""
     return {"inks": sorted(list(base_cols))}
-
 
 @app.post("/predict", response_model=PredictOut)
 def predict(inp: PredictIn):
@@ -252,13 +260,11 @@ def predict(inp: PredictIn):
         "allowed_inks": sorted(list(allowed)),
     }
 
-
+# Existing logger (kept for compatibility)
 @app.post("/log_approved")
 def log_approved(payload: LogIn):
     """
     Save an approved/tweaked formula into a local sqlite DB.
-
-    This is what the web UI calls when you click "Save edited formula".
     """
     conn = get_db()
     cur = conn.cursor()
@@ -279,8 +285,8 @@ def log_approved(payload: LogIn):
             payload.target_L,
             payload.target_a,
             payload.target_b,
-            json.dumps(payload.suggested or {}, ensure_ascii=False),
-            json.dumps(payload.approved or {}, ensure_ascii=False),
+            json.dumps(_to_float_dict(payload.suggested), ensure_ascii=False),
+            json.dumps(_to_float_dict(payload.approved or {}), ensure_ascii=False),
             payload.measured_L,
             payload.measured_a,
             payload.measured_b,
@@ -292,6 +298,61 @@ def log_approved(payload: LogIn):
     conn.close()
     return {"ok": True, "id": int(new_id)}
 
+# NEW: alias that matches the UI payload shape
+@app.post("/log_correction")
+def log_correction(payload: CorrectionIn):
+    """
+    Accepts the UI shape:
+    {
+      target: {L, a, b},
+      group: "Greens" | null,
+      original: {...},
+      corrected: {...},
+      context_name: "PANTONE 485 C" | null,
+      note: "...",
+      measured: {L, a, b} | null
+    }
+    and stores it in the same feedback table.
+    """
+    t = payload.target or {}
+    L = float(t.get("L") or t.get("L*") or 0.0)
+    a = float(t.get("a") or t.get("a*") or 0.0)
+    b = float(t.get("b") or t.get("b*") or 0.0)
+
+    measured = payload.measured or {}
+    mL = measured.get("L") or measured.get("L*")
+    ma = measured.get("a") or measured.get("a*")
+    mb = measured.get("b") or measured.get("b*")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO feedback (
+            pantone,
+            target_L, target_a, target_b,
+            suggested_json,
+            approved_json,
+            measured_L, measured_a, measured_b,
+            notes
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload.context_name,
+            L, a, b,
+            json.dumps(_to_float_dict(payload.original), ensure_ascii=False),
+            json.dumps(_to_float_dict(payload.corrected), ensure_ascii=False),
+            (float(mL) if mL is not None else None),
+            (float(ma) if ma is not None else None),
+            (float(mb) if mb is not None else None),
+            payload.note,
+        ),
+    )
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return {"ok": True, "id": int(new_id)}
 
 @app.get("/export_training")
 def export_training():
